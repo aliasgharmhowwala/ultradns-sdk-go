@@ -28,9 +28,14 @@ const (
 	DefaultLiveBaseURL = "https://restapi.ultradns.com/"
 
 	userAgent = "udnssdk-go/" + libraryVersion
-
-	apiVersion = "v1"
 )
+
+type CustomHeader struct {
+	Key   string
+	Value string
+}
+
+var SetCustomHeader []CustomHeader
 
 // QueryInfo wraps a query request
 type QueryInfo struct {
@@ -69,7 +74,9 @@ type Client struct {
 	// Probes API
 	Probes *ProbesService
 	// Resource Record Sets API
-	RRSets *RRSetsService
+	RRSets RRSetsService
+	// Zones API
+	Zone ZoneService
 	// Tasks API
 	Tasks *TasksService
 }
@@ -96,7 +103,8 @@ func NewClient(username, password, baseURL string) (*Client, error) {
 	c.Events = &EventsService{client: c}
 	c.Notifications = &NotificationsService{client: c}
 	c.Probes = &ProbesService{client: c}
-	c.RRSets = &RRSetsService{client: c}
+	c.RRSets = &RRSetsServiceHandler{client: c}
+	c.Zone = &ZoneServiceHandler{client: c}
 	c.Tasks = &TasksService{client: c}
 	return c, nil
 }
@@ -119,7 +127,8 @@ func newStubClient(username, password, baseURL, clientID, clientSecret string) (
 	c.Events = &EventsService{client: c}
 	c.Notifications = &NotificationsService{client: c}
 	c.Probes = &ProbesService{client: c}
-	c.RRSets = &RRSetsService{client: c}
+	c.RRSets = &RRSetsServiceHandler{client: c}
+	c.Zone = &ZoneServiceHandler{client: c}
 	c.Tasks = &TasksService{client: c}
 	return c, nil
 }
@@ -131,7 +140,7 @@ func (c *Client) NewRequest(method, pathquery string, payload interface{}) (*htt
 	url := *c.BaseURL
 
 	pq := strings.SplitN(pathquery, "?", 2)
-	url.Path = url.Path + fmt.Sprintf("%s/%s", apiVersion, pq[0])
+	url.Path = url.Path + fmt.Sprintf("%s", pq[0])
 	if len(pq) == 2 {
 		url.RawQuery = pq[1]
 	}
@@ -143,8 +152,9 @@ func (c *Client) NewRequest(method, pathquery string, payload interface{}) (*htt
 			return nil, err
 		}
 	}
-
-	req, err := http.NewRequest(method, url.String(), body)
+	// Reverting back the URL encoding of modulo(%) as we don't require to encode (%)
+	urlString := strings.Replace(url.String(), "%252F", "%2F", -1)
+	req, err := http.NewRequest(method, urlString, body)
 	if err != nil {
 		return nil, err
 	}
@@ -152,6 +162,12 @@ func (c *Client) NewRequest(method, pathquery string, payload interface{}) (*htt
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Add("Accept", "application/json")
 	req.Header.Add("User-Agent", c.UserAgent)
+
+	if len(SetCustomHeader) != 0 {
+		for _, customHeader := range SetCustomHeader {
+			req.Header.Add(customHeader.Key, customHeader.Value)
+		}
+	}
 
 	return req, nil
 }

@@ -4,14 +4,24 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/fatih/structs"
 	"github.com/mitchellh/mapstructure"
 )
 
-// RRSetsService provides access to RRSet resources
-type RRSetsService struct {
+type RRSetsService interface {
+	Select(k RRSetKey) ([]RRSet, error)
+	SelectWithOffset(k RRSetKey, offset int) ([]RRSet, ResultInfo, *http.Response, error)
+	SelectWithOffsetWithLimit(k RRSetKey, offset int, limit int) ([]RRSet, ResultInfo, *http.Response, error)
+	Create(k RRSetKey, rrset RRSet) (*http.Response, error)
+	Update(k RRSetKey, val RRSet) (*http.Response, error)
+	Delete(k RRSetKey) (*http.Response, error)
+}
+
+// RRSetsServiceHandler provides access to RRSet resources
+type RRSetsServiceHandler struct {
 	client *Client
 }
 
@@ -161,6 +171,7 @@ type DPRDataInfo struct {
 	AllNonConfigured bool     `json:"allNonConfigured,omitempty" terraform:"all_non_configured"`
 	IPInfo           *IPInfo  `json:"ipInfo,omitempty" terraform:"ip_info"`
 	GeoInfo          *GeoInfo `json:"geoInfo,omitempty" terraform:"geo_info"`
+	TTL              int      `json:"ttl,omitempty" terraform:"ttl"`   // Required as per Rest API
 	Type             string   `json:"type,omitempty" terraform:"type"` // not mentioned in REST API doc
 }
 
@@ -200,13 +211,13 @@ type SBPoolProfile struct {
 
 // SBRDataInfo wraps the rdataInfo object of a SBPoolProfile
 type SBRDataInfo struct {
-	State            string `json:"state"`
-	RunProbes        bool   `json:"runProbes"`
-	Priority         int    `json:"priority"`
-	FailoverDelay    int    `json:"failoverDelay,omitempty"`
-	Threshold        int    `json:"threshold"`
-	Weight           int    `json:"weight"`
-	AvailableToServe bool   `json:"availableToServe,omitempty"`
+	State            string      `json:"state"`
+	RunProbes        bool        `json:"runProbes"`
+	Priority         int         `json:"priority"`
+	FailoverDelay    int         `json:"failoverDelay,omitempty"`
+	Threshold        int         `json:"threshold"`
+	Weight           interface{} `json:"weight"`
+	AvailableToServe bool        `json:"availableToServe,omitempty"`
 }
 
 // BackupRecord wraps the backupRecord objects of an SBPoolProfile response
@@ -232,7 +243,7 @@ type TCPoolProfile struct {
 type RRSet struct {
 	OwnerName string     `json:"ownerName"`
 	RRType    string     `json:"rrtype"`
-	TTL       int        `json:"ttl"`
+	TTL       int        `json:"ttl,omitempty"`
 	RData     []string   `json:"rdata"`
 	Profile   RawProfile `json:"profile,omitempty"`
 }
@@ -254,11 +265,15 @@ type RRSetKey struct {
 
 // URI generates the URI for an RRSet
 func (k RRSetKey) URI() string {
-	uri := fmt.Sprintf("zones/%s/rrsets", k.Zone)
+	// Escaping Reverse Domain
+	zoneName := strings.Replace(k.Zone, "/", "%2F", -1)
+	uri := fmt.Sprintf("zones/%s/rrsets", zoneName)
 	if k.Type != "" {
-		uri += fmt.Sprintf("/%v", k.Type)
+		uri += fmt.Sprintf("/%s", k.Type)
 		if k.Name != "" {
-			uri += fmt.Sprintf("/%v", k.Name)
+			// Escaping Reverse Domain
+			ownerName := strings.Replace(k.Name, "/", "%2F", -1)
+			uri += fmt.Sprintf("/%s", ownerName)
 		}
 	}
 	return uri
@@ -335,7 +350,7 @@ func (k RRSetKey) ProbesQueryURI(query string) string {
 }
 
 // Select will list the zone rrsets, paginating through all available results
-func (s *RRSetsService) Select(k RRSetKey) ([]RRSet, error) {
+func (s *RRSetsServiceHandler) Select(k RRSetKey) ([]RRSet, error) {
 	// TODO: Sane Configuration for timeouts / retries
 	maxerrs := 5
 	waittime := 5 * time.Second
@@ -357,11 +372,11 @@ func (s *RRSetsService) Select(k RRSetKey) ([]RRSet, error) {
 			return rrsets, err
 		}
 
-		log.Printf("ResultInfo: %+v\n", ri)
 		for _, rrset := range reqRrsets {
 			rrsets = append(rrsets, rrset)
 		}
 		if ri.ReturnedCount+ri.Offset >= ri.TotalCount {
+			log.Printf("ResultInfo: %+v\n", ri)
 			return rrsets, nil
 		}
 		offset = ri.ReturnedCount + ri.Offset
@@ -370,32 +385,39 @@ func (s *RRSetsService) Select(k RRSetKey) ([]RRSet, error) {
 }
 
 // SelectWithOffset requests zone rrsets by RRSetKey & optional offset
-func (s *RRSetsService) SelectWithOffset(k RRSetKey, offset int) ([]RRSet, ResultInfo, *http.Response, error) {
+func (s *RRSetsServiceHandler) SelectWithOffset(k RRSetKey, offset int) ([]RRSet, ResultInfo, *http.Response, error) {
 	var rrsld RRSetListDTO
 
 	uri := k.QueryURI(offset)
 	res, err := s.client.get(uri, &rrsld)
 
-	rrsets := []RRSet{}
-	for _, rrset := range rrsld.Rrsets {
-		rrsets = append(rrsets, rrset)
-	}
-	return rrsets, rrsld.Resultinfo, res, err
+	return rrsld.Rrsets, rrsld.Resultinfo, res, err
+}
+
+// SelectWithOffsetWilthLimit requests zone rrsets by RRSetKey & optional offset & limit
+func (s *RRSetsServiceHandler) SelectWithOffsetWithLimit(k RRSetKey, offset int, limit int) ([]RRSet, ResultInfo, *http.Response, error) {
+	var rrsld RRSetListDTO
+
+	uri := k.QueryURI(offset)
+
+	uri = fmt.Sprintf("%s&limit=%d", uri, limit)
+	res, err := s.client.get(uri, &rrsld)
+	return rrsld.Rrsets, rrsld.Resultinfo, res, err
 }
 
 // Create creates an rrset with val
-func (s *RRSetsService) Create(k RRSetKey, rrset RRSet) (*http.Response, error) {
+func (s *RRSetsServiceHandler) Create(k RRSetKey, rrset RRSet) (*http.Response, error) {
 	var ignored interface{}
 	return s.client.post(k.URI(), rrset, &ignored)
 }
 
 // Update updates a RRSet with the provided val
-func (s *RRSetsService) Update(k RRSetKey, val RRSet) (*http.Response, error) {
+func (s *RRSetsServiceHandler) Update(k RRSetKey, val RRSet) (*http.Response, error) {
 	var ignored interface{}
 	return s.client.put(k.URI(), val, &ignored)
 }
 
 // Delete deletes an RRSet
-func (s *RRSetsService) Delete(k RRSetKey) (*http.Response, error) {
+func (s *RRSetsServiceHandler) Delete(k RRSetKey) (*http.Response, error) {
 	return s.client.delete(k.URI(), nil)
 }
